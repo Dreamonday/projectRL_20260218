@@ -1,0 +1,46 @@
+data:
+  prediction_dir: "/data/project_20251211/tests/inference_results/timexer_v0.45_20260211180709_20260119170929_500120_20260211192807"
+  market_filter: "all"        # "us", "cn", "all"
+  max_stocks: null             # 不限制，使用所有通过过滤的股票
+  use_train_data: true        # 是否使用训练集数据
+  use_val_data: true          # 是否使用验证集数据
+  min_data_points: 20         # 每只股票最少数据点数
+  
+  # v0.4 新增配置: 强制降采样
+  force_resample: 
+    enabled: true
+    rule: "W-FRI"            # 每周五 (W-FRI)
+    method: "last"           # 取该周期最后一个有效数据点
+
+trading:
+  initial_cash: 10000000.0    # 初始资金 1000万美元
+  transaction_cost: 0.001     # 单边交易成本 0.1%
+  max_weight_per_stock: 0.5   # 单只股票最大仓位 50%
+  min_trade_amount: 0.001     # 最小交易量 (占总资产比例)
+
+rl:
+  algorithm: "PPO"
+  total_timesteps: 150000     # 保持 150k
+  learning_rate: 0.00005      # 降低学习率到 5e-5 (v0.4.3 fix)
+  batch_size: 512             # 增加 batch_size 以稳定梯度 (v0.4.3 fix)
+  n_steps: 1024               # 增加 rollout 长度 (v0.4.3 fix)
+  n_epochs: 5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01              # 降低熵系数到 0.01 (v0.4.3 fix)
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  policy_net: [1024, 512]
+  normalize_observations: true
+  normalize_rewards: false    # 保持 false
+  device: "cuda"
+
+split:
+  rl_train_end_date: "2025-10-31"   # RL训练集截止日期
+  rl_test_start_date: "2025-11-01"  # RL测试集起始日期
+
+reward:
+  type: "excess_return"       # 使用超额收益奖励 (Portfolio - Market)
+  turnover_penalty: 1.0       # 换手率惩罚系数 (乘以交易成本)
+  drawdown_penalty: 0.0       # 回撤惩罚系数

@@ -1,0 +1,36 @@
+data:
+  # v0.3 数据准备脚本输出的 npz 文件 (运行后填入实际路径)
+  dataset_dir: "/data/projectRL_20260218/data/processed_data/rl_dataset_202603101011"
+  # dataset_dir 下应包含: train_dataset.npz, test_dataset.npz, metadata.json
+  # 数据粒度说明: 由 prepare_rl_data_v0.3 的 --resample 参数决定。
+  #   若传 --resample W-FRI，则每行=1周；若不传，则每行=1交易日。
+
+trading:
+  initial_cash: 10000000.0
+  transaction_cost: 0.001
+  max_weight_per_stock: 0.10
+  softmax_temperature: 1.0
+
+rl:
+  algorithm: "PPO"
+  total_timesteps: 20000
+  learning_rate: 0.0003
+  batch_size: 32
+  n_steps: 512
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden_dim: 64
+  n_heads: 2
+  temporal_window: 10
+  normalize_observations: true
+  normalize_rewards: false
+  device: "cuda"
+
+reward:
+  type: "log_return"
+  turnover_penalty: 0.5

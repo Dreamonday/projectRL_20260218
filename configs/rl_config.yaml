@@ -1,0 +1,41 @@
+data:
+  prediction_dir: "/data/project_20251211/tests/inference_results/timexer_v0.45_20260211180709_20260119170929_500120_20260211192807"
+  market_filter: "all"        # "us", "cn", "all"
+  max_stocks: null             # 不限制，使用所有通过过滤的股票
+  use_train_data: true        # 是否使用训练集数据 (月频, 2012-2025)
+  use_val_data: true          # 是否使用验证集数据 (周频, 2025-2026)
+  min_data_points: 20         # 每只股票最少数据点数
+  resample_to_weekly: false   # 是否重采样到周频
+
+trading:
+  initial_cash: 10000000.0    # 初始资金 1000万美元
+  transaction_cost: 0.001     # 单边交易成本 0.1%
+  max_weight_per_stock: 0.5   # 单只股票最大仓位 50%
+  min_trade_amount: 0.001     # 最小交易量 (占总资产比例)
+
+rl:
+  algorithm: "PPO"
+  total_timesteps: 100000
+  learning_rate: 0.0001
+  batch_size: 256
+  n_steps: 512
+  n_epochs: 5
+  gamma: 0.99                 # 折扣因子
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.0               # 关闭熵奖励 (1395维动作空间下 entropy~1979 会压制训练)
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  policy_net: [1024, 512]     # 策略网络隐藏层 (增大以适应更多股票)
+  normalize_observations: true
+  normalize_rewards: true
+  device: "cuda"              # 使用GPU训练
+
+split:
+  rl_train_end_date: "2025-10-31"   # RL训练集截止日期
+  rl_test_start_date: "2025-11-01"  # RL测试集起始日期
+
+reward:
+  type: "log_return"          # "log_return" 或 "simple_return"
+  turnover_penalty: 1.0       # 换手率惩罚系数 (乘以交易成本)
+  drawdown_penalty: 0.0       # 回撤惩罚系数

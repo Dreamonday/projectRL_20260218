@@ -1,0 +1,38 @@
+data:
+  dataset_dir: ""
+  val_years: 5
+  periods_per_year: 52
+
+trading:
+  initial_cash: 10000000.0
+  transaction_cost: 0.001
+  max_weight_per_stock: 0.10
+  softmax_temperature: 1.0
+  trade_interval: 4
+
+rl:
+  algorithm: "PPO"
+  total_timesteps: 50000
+  learning_rate: 0.0003
+  batch_size: 64
+  n_steps: 2048
+  n_epochs: 30
+  gamma: 1.0
+  gae_lambda: 0.95
+  clip_range: 0.5
+  ent_coef: 0.02
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden_dim: 64
+  n_heads: 2
+  temporal_window: 30
+  normalize_observations: true
+  normalize_rewards: false
+  device: "cuda"
+  min_episode_years: 3
+
+early_stopping:
+  enabled: true
+  eval_freq: 2560
+  patience: 5
+  metric: "annualized_return"

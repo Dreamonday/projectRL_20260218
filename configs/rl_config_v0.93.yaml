@@ -1,0 +1,51 @@
+data:
+  # 留空，请在训练脚本 train_rl_v0.93 中设置 DATASET_DIR
+  dataset_dir: ""
+  # dataset_dir 下应包含: train_dataset.npz, test_dataset.npz, metadata.json
+  # 数据粒度说明: 由 prepare_rl_data_v0.3 的 --resample 参数决定。
+  #   若传 --resample W-FRI，则每行=1周；若不传，则每行=1交易日。
+
+trading:
+  initial_cash: 10000000.0
+  transaction_cost: 0.001
+  max_weight_per_stock: 0.10
+  softmax_temperature: 1.0
+  # v0.92: 交易间隔。周频数据下 4=每月交易1次，1=每周交易1次(与v0.91一致)
+  trade_interval: 4
+
+rl:
+  algorithm: "PPO"
+  total_timesteps: 50000
+  learning_rate: 0.0003
+  batch_size: 64
+  n_steps: 512
+  n_epochs: 10
+  gamma: 1.0   # 不折扣远期收益，追求长期回报
+  gae_lambda: 0.95
+  clip_range: 0.5
+  ent_coef: 0.02
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden_dim: 64
+  n_heads: 2
+  temporal_window: 30   # 周频=30周, 日频=30交易日
+  normalize_observations: true
+  normalize_rewards: false
+  device: "cuda"
+
+# v0.93: 早停配置
+early_stopping:
+  enabled: true
+  eval_freq: 2560        # 每 2560 timesteps 评估一次
+  patience: 5            # 连续 3 次组合指标不提升则停止
+  # 组合指标 = train_weight * train_composite + val_weight * val_composite
+  # composite = (sharpe + sortino + calmar + return_scale*年化收益 + alpha_scale*alpha) / 5
+  # alpha = 模型年化收益 - 等权BH年化收益
+  train_weight: 0.8
+  val_weight: 0.2
+  return_scale: 5        # 年化收益缩放，20%→1.0
+  alpha_scale: 10       # 超额收益缩放，10%→1.0
+
+reward:
+  type: "log_return"
+  turnover_penalty: 0.5

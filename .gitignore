@@ -1,0 +1,65 @@
+# 虚拟环境
+.conda_env/
+venv/
+env/
+ENV/
+
+# 数据文件
+data/
+
+# 实验结果和模型权重
+experiments/
+
+# Python缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 分发/打包
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch
+*.pth
+*.pt
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# TensorBoard
+tensorboard/
+*/tensorboard/
+
+# 临时文件
+*.tmp
+*.bak
+*.swp
