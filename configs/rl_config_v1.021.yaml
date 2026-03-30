@@ -1,3 +1,4 @@
+# v1.021: 与 v1.02 相同参数，配合 train_rl_v1.021_20260317.py（显存 OOM 修复）
 data:
   dataset_dir: ""
   val_years: 5
@@ -8,7 +9,7 @@ trading:
   transaction_cost: 0.001
   max_weight_per_stock: 0.10
   softmax_temperature: 1.0
-  trade_interval: 1
+  trade_interval: 4
 
 rl:
   algorithm: "PPO"
@@ -34,5 +35,5 @@ rl:
 early_stopping:
   enabled: true
   eval_freq: 0
-  patience: 5
+  patience: 3
   metric: "annualized_return"

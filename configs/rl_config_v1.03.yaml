@@ -26,6 +26,10 @@ rl:
   hidden_dim: 64
   n_heads: 2
   temporal_window: 30
+  # v1.03 新增: 跨股票注意力
+  cross_stock_heads: 2
+  # v1.03 新增: Critic 隐藏层维度
+  value_hidden_dim: 128
   normalize_observations: true
   normalize_rewards: false
   device: "cuda"

@@ -1,17 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-RL 交易模型训练 v1.1 — Actor/Critic 完全独立
-版本: v1.1
+RL 交易模型训练 v1.021 — GPU 优化 + 显存 OOM 修复
+版本: v1.021
 日期: 20260317
 
-v1.1 变更 (基于 v1.01):
-  - Actor 与 Critic 使用完全独立的网络，互不共享参数
-  - 预测、判断时互不干扰
-  - buffer 逻辑与 v1.01 一致：容量 2*n_steps，每次加入完整 episode 不截断
+v1.021 变更 (基于 v1.02):
+  - rollout_buffer.reset() 前显式释放旧 GPU 张量并调用 empty_cache，缓解 OOM
 
 使用方式:
-    python scripts/train_rl_v1.1_20260317.py --config configs/rl_config_v1.1.yaml
+    python scripts/train_rl_v1.021_20260317.py --config configs/rl_config_v1.021.yaml
 """
 
 import json
@@ -40,6 +38,7 @@ from stable_baselines3.common.callbacks import BaseCallback, CallbackList  # noq
 from stable_baselines3.common.monitor import Monitor  # noqa: E402
 from stable_baselines3.common.policies import ActorCriticPolicy  # noqa: E402
 from stable_baselines3.common.utils import obs_as_tensor  # noqa: E402
+from stable_baselines3.common.type_aliases import RolloutBufferSamples  # noqa: E402
 
 from src.utils.backtest import (  # noqa: E402
     compute_metrics,
@@ -366,9 +365,7 @@ class MultiStockTradingEnvV10(gym.Env):
         return self._get_obs(), reward, terminated, truncated, info
 
 
-class SeparateTemporalExtractor(nn.Module):
-    """v1.1: Actor 与 Critic 完全独立的网络，互不共享参数"""
-
+class TemporalScoringMlpExtractor(nn.Module):
     def __init__(self, feature_dim, n_stocks, temporal_window,
                  n_market_features=9, hidden_dim=64, n_heads=2):
         super().__init__()
@@ -377,42 +374,27 @@ class SeparateTemporalExtractor(nn.Module):
         self.n_market = n_market_features
         self.n_per_stock = temporal_window * n_market_features + 1
         embed_dim = hidden_dim // 2
-
-        # Actor 独立编码器
-        self.actor_input_proj = nn.Linear(n_market_features, embed_dim)
-        self.actor_pos_encoding = nn.Parameter(torch.randn(1, temporal_window, embed_dim) * 0.02)
-        self.actor_temporal_attn = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True, dropout=0.0)
-        self.actor_attn_norm = nn.LayerNorm(embed_dim)
-        self.actor_ffn = nn.Sequential(
+        self.input_proj = nn.Linear(n_market_features, embed_dim)
+        self.pos_encoding = nn.Parameter(torch.randn(1, temporal_window, embed_dim) * 0.02)
+        self.temporal_attn = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True, dropout=0.0)
+        self.attn_norm = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 2),
             nn.GELU(),
             nn.Linear(embed_dim * 2, embed_dim),
         )
-        self.actor_ffn_norm = nn.LayerNorm(embed_dim)
+        self.ffn_norm = nn.LayerNorm(embed_dim)
         self.score_head = nn.Sequential(
             nn.Linear(embed_dim + 1, embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, 1),
         )
-
-        # Critic 独立编码器
-        self.critic_input_proj = nn.Linear(n_market_features, embed_dim)
-        self.critic_pos_encoding = nn.Parameter(torch.randn(1, temporal_window, embed_dim) * 0.02)
-        self.critic_temporal_attn = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True, dropout=0.0)
-        self.critic_attn_norm = nn.LayerNorm(embed_dim)
-        self.critic_ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 2),
-            nn.GELU(),
-            nn.Linear(embed_dim * 2, embed_dim),
-        )
-        self.critic_ffn_norm = nn.LayerNorm(embed_dim)
         self.value_mlp = nn.Sequential(
             nn.Linear(embed_dim + N_GLOBAL_FEATURES, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, embed_dim),
             nn.ReLU(),
         )
-
         self.latent_dim_pi = n_stocks
         self.latent_dim_vf = embed_dim
 
@@ -427,54 +409,41 @@ class SeparateTemporalExtractor(nn.Module):
         global_obs = features[:, n:]
         return temporal, current_weight, global_obs
 
-    def _temporal_encode_actor(self, temporal):
+    def _temporal_encode(self, temporal):
         B, N, W, F = temporal.shape
         x = temporal.reshape(B * N, W, F)
-        h = self.actor_input_proj(x) + self.actor_pos_encoding[:, :W, :]
-        attn_out, _ = self.actor_temporal_attn(h, h, h)
-        h = self.actor_attn_norm(h + attn_out)
-        h = self.actor_ffn_norm(h + self.actor_ffn(h))
-        embeddings = h[:, -1, :]
-        return embeddings.reshape(B, N, -1)
-
-    def _temporal_encode_critic(self, temporal):
-        B, N, W, F = temporal.shape
-        x = temporal.reshape(B * N, W, F)
-        h = self.critic_input_proj(x) + self.critic_pos_encoding[:, :W, :]
-        attn_out, _ = self.critic_temporal_attn(h, h, h)
-        h = self.critic_attn_norm(h + attn_out)
-        h = self.critic_ffn_norm(h + self.critic_ffn(h))
+        h = self.input_proj(x) + self.pos_encoding[:, :W, :]
+        attn_out, _ = self.temporal_attn(h, h, h)
+        h = self.attn_norm(h + attn_out)
+        h = self.ffn_norm(h + self.ffn(h))
         embeddings = h[:, -1, :]
         return embeddings.reshape(B, N, -1)
 
     def forward(self, features):
         temporal, current_weight, global_obs = self._parse_obs(features)
-        actor_emb = self._temporal_encode_actor(temporal)
-        critic_emb = self._temporal_encode_critic(temporal)
-        score_in = torch.cat([actor_emb, current_weight], dim=-1)
+        embeddings = self._temporal_encode(temporal)
+        score_in = torch.cat([embeddings, current_weight], dim=-1)
         scores = self.score_head(score_in).squeeze(-1)
-        pooled = critic_emb.mean(dim=1)
+        pooled = embeddings.mean(dim=1)
         value_input = torch.cat([pooled, global_obs], dim=1)
         vf = self.value_mlp(value_input)
         return scores, vf
 
     def forward_actor(self, features):
         temporal, current_weight, _ = self._parse_obs(features)
-        embeddings = self._temporal_encode_actor(temporal)
+        embeddings = self._temporal_encode(temporal)
         score_in = torch.cat([embeddings, current_weight], dim=-1)
         return self.score_head(score_in).squeeze(-1)
 
     def forward_critic(self, features):
         temporal, _, global_obs = self._parse_obs(features)
-        embeddings = self._temporal_encode_critic(temporal)
+        embeddings = self._temporal_encode(temporal)
         pooled = embeddings.mean(dim=1)
         value_input = torch.cat([pooled, global_obs], dim=1)
         return self.value_mlp(value_input)
 
 
-class TemporalScoringPolicyV11(ActorCriticPolicy):
-    """v1.1: 使用完全独立的 Actor/Critic 网络"""
-
+class TemporalScoringPolicy(ActorCriticPolicy):
     def __init__(self, observation_space, action_space, lr_schedule,
                  n_stocks=100, temporal_window=10, n_market_features=9,
                  hidden_dim=64, n_heads=2, **kwargs):
@@ -486,7 +455,7 @@ class TemporalScoringPolicyV11(ActorCriticPolicy):
         super().__init__(observation_space, action_space, lr_schedule, **kwargs)
 
     def _build_mlp_extractor(self):
-        self.mlp_extractor = SeparateTemporalExtractor(
+        self.mlp_extractor = TemporalScoringMlpExtractor(
             self.features_dim, self._n_stocks, self._temporal_window,
             self._n_market, self._hidden_dim, self._n_heads,
         )
@@ -539,8 +508,146 @@ class CompleteEpisodeRolloutBuffer(RolloutBuffer):
             start_idx += batch_size
 
 
+class GPUCompleteEpisodeRolloutBuffer(CompleteEpisodeRolloutBuffer):
+    """
+    v1.021: GPU 优化的 RolloutBuffer + 显存 OOM 修复
+    - observations 存入 GPU
+    - values、log_probs 保持为 tensor，不转 numpy
+    - GAE 计算全程在 GPU
+    - reset() 前显式释放旧张量并 empty_cache，避免下一轮 rollout 时 OOM
+    """
+
+    def reset(self):
+        super().reset()
+        self.generator_ready = False
+        self._values_list = []
+        self._log_probs_list = []
+        # v1.021: 显式释放旧 GPU 张量，再分配新的，缓解显存碎片化导致的 OOM
+        if hasattr(self, "_obs_tensor") and self._obs_tensor is not None:
+            del self._obs_tensor
+            self._obs_tensor = None
+        if hasattr(self, "_obs_flat") and self._obs_flat is not None:
+            del self._obs_flat
+            self._obs_flat = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        obs_shape = (self.buffer_size, self.n_envs, *self.obs_shape)
+        self._obs_tensor = torch.zeros(obs_shape, dtype=torch.float32, device=self.device)
+        self._values_tensor = None
+        self._log_probs_tensor = None
+        self._advantages_tensor = None
+        self._returns_tensor = None
+
+    def add(self, obs, action, reward, episode_start, value, log_prob):
+        """存储 obs 到 GPU，values/log_probs 保持为 tensor"""
+        if len(log_prob.shape) == 0:
+            log_prob = log_prob.reshape(-1, 1)
+        if isinstance(self.observation_space, spaces.Discrete):
+            obs = obs.reshape((self.n_envs, *self.obs_shape))
+        action = action.reshape((self.n_envs, self.action_dim))
+
+        obs_t = torch.from_numpy(np.array(obs)).float().to(self.device)
+        if obs_t.dim() == 1:
+            obs_t = obs_t.unsqueeze(0)
+        self._obs_tensor[self.pos] = obs_t
+        self.observations[self.pos] = np.array(obs)
+        self.actions[self.pos] = np.array(action)
+        self.rewards[self.pos] = np.array(reward)
+        self.episode_starts[self.pos] = np.array(episode_start)
+        v_flat = value.flatten() if value.numel() > 1 else value.reshape(1)
+        lp_flat = log_prob.flatten() if log_prob.numel() > 1 else log_prob.reshape(-1)
+        self.values[self.pos] = value.detach().cpu().numpy().flatten()
+        self.log_probs[self.pos] = log_prob.detach().cpu().numpy()
+        self._values_list.append(value.detach())
+        self._log_probs_list.append(log_prob.detach())
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+
+    def compute_returns_and_advantage(self, last_values, dones):
+        """GAE 全程在 GPU 上计算"""
+        n_valid = self.pos
+        last_vals = last_values.flatten().to(self.device)
+        dones_t = torch.from_numpy(dones.astype(np.float32)).to(self.device)
+
+        values_list = []
+        for i in range(n_valid):
+            v = self._values_list[i]
+            v_flat = v.flatten() if v.numel() > 1 else v.reshape(1)
+            values_list.append(v_flat[: self.n_envs])
+        values_t = torch.stack(values_list).to(self.device)
+        if values_t.dim() == 1:
+            values_t = values_t.unsqueeze(1)
+        rewards_t = torch.from_numpy(self.rewards[:n_valid]).to(self.device)
+        ep_starts_t = torch.from_numpy(self.episode_starts[:n_valid]).to(self.device)
+
+        last_gae_lam = torch.zeros(self.n_envs, device=self.device, dtype=torch.float32)
+        advantages_t = torch.zeros((n_valid, self.n_envs), device=self.device, dtype=torch.float32)
+
+        for step in reversed(range(n_valid)):
+            if step == n_valid - 1:
+                next_non_terminal = 1.0 - dones_t
+                next_values = last_vals
+            else:
+                next_non_terminal = 1.0 - ep_starts_t[step + 1]
+                next_values = values_t[step + 1].flatten()
+            delta = rewards_t[step] + self.gamma * next_values * next_non_terminal - values_t[step].flatten()
+            last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
+            advantages_t[step] = last_gae_lam
+
+        returns_t = advantages_t + values_t
+        self.advantages = advantages_t.cpu().numpy()
+        self.returns = returns_t.cpu().numpy()
+        self._advantages_tensor = advantages_t
+        self._returns_tensor = returns_t
+        self._values_tensor = values_t
+        lp_list = []
+        for i in range(n_valid):
+            lp = self._log_probs_list[i]
+            lp_flat = lp.flatten() if lp.numel() > 1 else lp.reshape(1)
+            lp_list.append(lp_flat[: self.n_envs])
+        self._log_probs_tensor = torch.stack(lp_list).to(self.device)
+        if self._log_probs_tensor.dim() == 1:
+            self._log_probs_tensor = self._log_probs_tensor.unsqueeze(1)
+
+    def get(self, batch_size=None):
+        """使用 GPU 上的数据，避免每 batch CPU->GPU 传输"""
+        assert self.full, "Buffer must be full before get()"
+        n_valid = self.pos * self.n_envs
+        indices = np.random.permutation(n_valid)
+        if not self.generator_ready:
+            self._obs_flat = self._obs_tensor[: self.pos].swapaxes(0, 1).reshape(n_valid, *self.obs_shape)
+            self._values_flat = self._values_tensor.swapaxes(0, 1).reshape(-1)
+            self._log_probs_flat = self._log_probs_tensor.swapaxes(0, 1).reshape(-1)
+            self._advantages_flat = self._advantages_tensor.swapaxes(0, 1).reshape(-1)
+            self._returns_flat = self._returns_tensor.swapaxes(0, 1).reshape(-1)
+            self.generator_ready = True
+        if batch_size is None:
+            batch_size = n_valid
+        start_idx = 0
+        while start_idx < n_valid:
+            yield self._get_samples_gpu(indices[start_idx : start_idx + batch_size])
+            start_idx += batch_size
+
+    def _get_samples_gpu(self, batch_inds):
+        """直接返回 GPU 上的 tensor，无需 to_torch 转换"""
+        batch_inds_t = torch.from_numpy(batch_inds).long().to(self.device)
+        obs_batch = self._obs_flat[batch_inds_t]
+        actions_batch = torch.from_numpy(
+            self.actions[: self.pos].swapaxes(0, 1).reshape(-1, self.action_dim)[batch_inds]
+        ).float().to(self.device)
+        return RolloutBufferSamples(
+            obs_batch,
+            actions_batch,
+            self._values_flat[batch_inds_t],
+            self._log_probs_flat[batch_inds_t],
+            self._advantages_flat[batch_inds_t],
+            self._returns_flat[batch_inds_t],
+        )
+
+
 class PPOCompleteEpisodes(PPO):
-    """v1.1: 仅收集完整 episode 的 transition 用于更新，buffer 容量 2*n_steps"""
+    """v1.01: 仅收集完整 episode 的 transition 用于更新，buffer 容量 2*n_steps"""
 
     def _setup_model(self):
         super()._setup_model()
@@ -616,18 +723,18 @@ class PPOCompleteEpisodes(PPO):
             ep_start = np.array(episode_starts, dtype=np.float32)
             if ep_start.ndim == 0:
                 ep_start = ep_start.reshape(1)
-            vals_np = values.cpu().numpy()
-            if vals_np.ndim == 0:
-                vals_np = vals_np.reshape(1)
-            log_probs_np = log_probs.cpu().numpy()
-            if log_probs_np.ndim == 0:
-                log_probs_np = log_probs_np.reshape(1)
+            vals_t = values.detach()
+            if vals_t.dim() == 0:
+                vals_t = vals_t.unsqueeze(0)
+            log_probs_t = log_probs.detach()
+            if log_probs_t.dim() == 0:
+                log_probs_t = log_probs_t.unsqueeze(0)
 
-            episode_buffer.append((obs_np.copy(), actions.copy(), rewards.copy(), ep_start.copy(), vals_np.copy(), log_probs_np.copy()))
+            episode_buffer.append((obs_np.copy(), actions.copy(), rewards.copy(), ep_start.copy(), vals_t, log_probs_t))
 
             if np.any(dones):
                 for o, a, r, es, v, lp in episode_buffer:
-                    rollout_buffer.add(o, a, r, es, torch.tensor(v, device=self.device), torch.tensor(lp, device=self.device))
+                    rollout_buffer.add(o, a, r, es, v, lp)
                 episode_buffer = []
 
                 if rollout_buffer.size() >= n_steps_target:
@@ -659,6 +766,124 @@ class PPOCompleteEpisodes(PPO):
         callback.on_rollout_end()
 
         return True
+
+
+class PPOCompleteEpisodesV102(PPOCompleteEpisodes):
+    """v1.021: GPU 优化 + 显存 OOM 修复"""
+
+    def _setup_model(self):
+        super()._setup_model()
+        self.rollout_buffer = GPUCompleteEpisodeRolloutBuffer(
+            self.n_steps * 2,
+            self.observation_space,
+            self.action_space,
+            device=self.device,
+            gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
+            n_envs=self.env.num_envs,
+        )
+
+    def train(self):
+        """重写 train，增加 epoch 级别进度打印"""
+        self.policy.set_training_mode(True)
+        self._update_learning_rate(self.policy.optimizer)
+        clip_range = self.clip_range(self._current_progress_remaining)
+        if self.clip_range_vf is not None:
+            clip_range_vf = self.clip_range_vf(self._current_progress_remaining)
+
+        entropy_losses = []
+        pg_losses, value_losses = [], []
+        clip_fractions = []
+
+        continue_training = True
+        n_batches = (self.rollout_buffer.pos * self.rollout_buffer.n_envs + self.batch_size - 1) // self.batch_size
+
+        for epoch in range(self.n_epochs):
+            approx_kl_divs = []
+            batch_idx = 0
+            for rollout_data in self.rollout_buffer.get(self.batch_size):
+                actions = rollout_data.actions
+                if isinstance(self.action_space, spaces.Discrete):
+                    actions = rollout_data.actions.long().flatten()
+
+                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+                values = values.flatten()
+                advantages = rollout_data.advantages
+                if self.normalize_advantage and len(advantages) > 1:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+                ratio = torch.exp(log_prob - rollout_data.old_log_prob)
+                policy_loss_1 = advantages * ratio
+                policy_loss_2 = advantages * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
+
+                pg_losses.append(policy_loss.item())
+                clip_fractions.append(torch.mean((torch.abs(ratio - 1) > clip_range).float()).item())
+
+                if self.clip_range_vf is None:
+                    values_pred = values
+                else:
+                    values_pred = rollout_data.old_values + torch.clamp(
+                        values - rollout_data.old_values, -clip_range_vf, clip_range_vf
+                    )
+                value_loss = torch.nn.functional.mse_loss(rollout_data.returns, values_pred)
+                value_losses.append(value_loss.item())
+
+                if entropy is None:
+                    entropy_loss = -torch.mean(-log_prob)
+                else:
+                    entropy_loss = -torch.mean(entropy)
+                entropy_losses.append(entropy_loss.item())
+
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+
+                with torch.no_grad():
+                    log_ratio = log_prob - rollout_data.old_log_prob
+                    approx_kl_div = torch.mean((torch.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                    approx_kl_divs.append(approx_kl_div)
+
+                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+                    continue_training = False
+                    if self.verbose >= 1:
+                        print(f"Early stopping at epoch {epoch} due to reaching max kl: {approx_kl_div:.2f}")
+                    break
+
+                self.policy.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.policy.optimizer.step()
+                batch_idx += 1
+
+            if (epoch + 1) % max(1, self.n_epochs // 5) == 0 or epoch == 0:
+                sys.stdout.write(f"\r  [train] epoch {epoch + 1}/{self.n_epochs}\n")
+                sys.stdout.flush()
+
+            self._n_updates += 1
+            if not continue_training:
+                break
+
+        from stable_baselines3.common.utils import explained_variance
+        n_valid = self.rollout_buffer.pos * self.rollout_buffer.n_envs
+        values_flat = self.rollout_buffer.values[: self.rollout_buffer.pos].flatten()
+        returns_flat = self.rollout_buffer.returns.flatten()
+        if len(values_flat) > n_valid:
+            values_flat = values_flat[:n_valid]
+        if len(returns_flat) > n_valid:
+            returns_flat = returns_flat[:n_valid]
+        explained_var = explained_variance(values_flat, returns_flat)
+        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+        self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+        self.logger.record("train/loss", loss.item())
+        self.logger.record("train/explained_variance", explained_var)
+        if hasattr(self.policy, "log_std"):
+            self.logger.record("train/std", torch.exp(self.policy.log_std).mean().item())
+        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        self.logger.record("train/clip_range", clip_range)
+        if self.clip_range_vf is not None:
+            self.logger.record("train/clip_range_vf", clip_range_vf)
 
 
 def _evaluate_val_annualized_return(env, model, norm_env=None):
@@ -701,6 +926,9 @@ class EarlyStoppingCallbackV1(BaseCallback):
 
     def _on_rollout_end(self):
         if self._should_stop:
+            return
+        # 仅在至少完成一次参数更新后再验证，避免用初始模型做验证
+        if getattr(self.model, "_n_updates", 0) == 0:
             return
         if self.num_timesteps < self._last_eval_at + self.eval_freq:
             return
@@ -1092,16 +1320,16 @@ def print_gpu_info():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RL 交易模型训练 v1.1 (Actor/Critic独立)")
+    parser = argparse.ArgumentParser(description="RL 交易模型训练 v1.021 (显存OOM修复)")
     parser.add_argument("--config", type=str,
-                        default=str(project_root / "configs" / "rl_config_v1.1.yaml"))
+                        default=str(project_root / "configs" / "rl_config_v1.021.yaml"))
     args = parser.parse_args()
 
     config = load_config(args.config)
     run_ts = datetime.now().strftime("%Y%m%d%H%M%S")
 
     print("=" * 70)
-    print(f"  RL 交易模型 v1.1 (Actor/Critic独立) — {run_ts}")
+    print(f"  RL 交易模型 v1.021 (显存OOM修复) — {run_ts}")
     print("=" * 70)
     print_gpu_info()
 
@@ -1161,7 +1389,7 @@ def main():
     print(f"  全量数据: {full_dataset.n_dates} 期")
     print(f"  验证集: {val_dataset.n_dates} 期 ({val_start_date} ~ {val_dataset.dates[-1]})")
     print(f"  训练随机起点上限: {max_train_start_idx} (对应日期 < {val_start_date})")
-    print(f"  v1.1: Actor 与 Critic 完全独立网络")
+    print(f"  v1.021: GPU buffer + reset 前显存释放")
 
     early_stop_cfg = config.get("early_stopping", {})
     early_stop_enabled = early_stop_cfg.get("enabled", False) and val_dataset.n_dates >= MIN_EPISODE_WEEKS
@@ -1178,7 +1406,7 @@ def main():
     if early_stop_enabled:
         print(f"  早停: eval_freq={early_stop_cfg.get('eval_freq', 2560)}, patience={early_stop_cfg.get('patience', 5)}")
 
-    output_dir = project_root / "experiments" / f"rl_ppo_v1.1_{run_ts}"
+    output_dir = project_root / "experiments" / f"rl_ppo_v1.021_{run_ts}"
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir = output_dir / "model"
     model_dir.mkdir(exist_ok=True)
@@ -1229,8 +1457,8 @@ def main():
     n_steps = rl_cfg["n_steps"]
     batch_size = rl_cfg["batch_size"]
 
-    model = PPOCompleteEpisodes(
-        policy=TemporalScoringPolicyV11,
+    model = PPOCompleteEpisodesV102(
+        policy=TemporalScoringPolicy,
         env=train_vec_env,
         learning_rate=rl_cfg["learning_rate"],
         n_steps=n_steps,
@@ -1277,11 +1505,7 @@ def main():
     best_path = model_dir / "ppo_trading_best.zip"
     if best_path.exists():
         print("  恢复早停最佳模型...")
-        model = PPOCompleteEpisodes.load(
-            str(model_dir / "ppo_trading_best"),
-            env=train_vec_env,
-            custom_objects={"policy": TemporalScoringPolicyV11},
-        )
+        model = PPOCompleteEpisodesV102.load(str(model_dir / "ppo_trading_best"), env=train_vec_env)
 
     model.save(str(model_dir / "ppo_trading"))
     if isinstance(train_vec_env, VecNormalize):
@@ -1323,7 +1547,7 @@ def main():
         plot_backtest(
             dates[:min_len], values[:min_len], bh_values[:min_len],
             save_path=str(results_dir / f"{prefix}_backtest.png"),
-            title=f"{prefix.capitalize()} Backtest (v1.1)",
+            title=f"{prefix.capitalize()} Backtest (v1.021)",
         )
         return metrics, bh_metrics
 

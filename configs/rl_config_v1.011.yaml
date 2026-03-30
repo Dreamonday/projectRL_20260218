@@ -1,3 +1,4 @@
+# v1.011 默认训练配置（与 v1.02 参数结构一致；脚本使用固定随机种子 42）
 data:
   dataset_dir: ""
   val_years: 5
@@ -8,7 +9,7 @@ trading:
   transaction_cost: 0.001
   max_weight_per_stock: 0.10
   softmax_temperature: 1.0
-  trade_interval: 1
+  trade_interval: 4
 
 rl:
   algorithm: "PPO"
